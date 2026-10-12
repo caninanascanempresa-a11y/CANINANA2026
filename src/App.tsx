@@ -170,23 +170,25 @@ export default function App() {
   // Fetch initial database state from Server DB, Supabase and Google Sheets
   useEffect(() => {
     const loadInitialData = async () => {
-      // 1. Tenta carregar do backend local (/api/db/load)
+      // 1. Tenta carregar do backend local (/api/db/load) se disponível
       try {
         const resp = await fetch(getApiUrl('/api/db/load'));
-        const resJson = await resp.json();
-        if (resJson.success && resJson.data) {
-          if (Array.isArray(resJson.data.products) && resJson.data.products.length > 0) {
-            setProducts(resJson.data.products);
-          }
-          if (Array.isArray(resJson.data.users) && resJson.data.users.length > 0) {
-            setUsers(resJson.data.users);
-          }
-          if (Array.isArray(resJson.data.movements) && resJson.data.movements.length > 0) {
-            setMovements(resJson.data.movements);
+        if (resp.ok && resp.headers.get('content-type')?.includes('application/json')) {
+          const resJson = await resp.json();
+          if (resJson.success && resJson.data) {
+            if (Array.isArray(resJson.data.products) && resJson.data.products.length > 0) {
+              setProducts(resJson.data.products);
+            }
+            if (Array.isArray(resJson.data.users) && resJson.data.users.length > 0) {
+              setUsers(resJson.data.users);
+            }
+            if (Array.isArray(resJson.data.movements) && resJson.data.movements.length > 0) {
+              setMovements(resJson.data.movements);
+            }
           }
         }
       } catch (err) {
-        // Servidor local não acessível no momento, segue com dados locais
+        // Ambiente Vercel estático / offline contingência normal
       }
 
       // 2. Tenta carregar do Supabase se disponível
