@@ -109,9 +109,12 @@ export default function App() {
     ];
   });
 
+  // Default Google Apps Script Web App URL for Caninana Auto Vidros
+  const DEFAULT_GAS_URL = 'https://script.google.com/macros/s/AKfycbxI024PKKAR0xvWgEOUBZzzyJz2zYbl6zzt41aLIQVvAzM9S5gVLAB_ucz2r5irlqch/exec';
+
   // Settings & Sync States
   const [gasUrl, setGasUrl] = useState<string>(() => {
-    return localStorage.getItem('caninana_gas_url') || '';
+    return localStorage.getItem('caninana_gas_url') || DEFAULT_GAS_URL;
   });
 
   const [backendUrl, setBackendUrl] = useState<string>(() => {
@@ -160,18 +163,36 @@ export default function App() {
     localStorage.setItem('caninana_gas_url', gasUrl);
   }, [gasUrl]);
 
-
-
   useEffect(() => {
     localStorage.setItem('caninana_users_db', JSON.stringify(users));
   }, [users]);
 
-  // Fetch initial database state from Supabase
+  // Fetch initial database state from Server DB, Supabase and Google Sheets
   useEffect(() => {
     const loadInitialData = async () => {
+      // 1. Tenta carregar do backend local (/api/db/load)
+      try {
+        const resp = await fetch(getApiUrl('/api/db/load'));
+        const resJson = await resp.json();
+        if (resJson.success && resJson.data) {
+          if (Array.isArray(resJson.data.products) && resJson.data.products.length > 0) {
+            setProducts(resJson.data.products);
+          }
+          if (Array.isArray(resJson.data.users) && resJson.data.users.length > 0) {
+            setUsers(resJson.data.users);
+          }
+          if (Array.isArray(resJson.data.movements) && resJson.data.movements.length > 0) {
+            setMovements(resJson.data.movements);
+          }
+        }
+      } catch (err) {
+        // Servidor local não acessível no momento, segue com dados locais
+      }
+
+      // 2. Tenta carregar do Supabase se disponível
       try {
         const { data: remoteProducts, error: prodErr } = await supabase.from('products').select('*');
-        if (!prodErr && remoteProducts) {
+        if (!prodErr && remoteProducts && remoteProducts.length > 0) {
           const parsedProducts: Product[] = remoteProducts.map(p => ({
             barcode: p.barcode,
             description: p.description,
@@ -184,7 +205,7 @@ export default function App() {
         }
 
         const { data: remoteUsers, error: userErr } = await supabase.from('users').select('*');
-        if (!userErr && remoteUsers) {
+        if (!userErr && remoteUsers && remoteUsers.length > 0) {
           setUsers(remoteUsers.map(u => ({
             username: u.username,
             name: u.name,
@@ -193,9 +214,16 @@ export default function App() {
           })));
         }
       } catch (err) {
-        console.error('Could not load database from Supabase, using offline cached data', err);
+        // Supabase offline
+      }
+
+      // 3. Tenta carregar dados atualizados da Planilha Google em segundo plano
+      const activeGas = localStorage.getItem('caninana_gas_url') || DEFAULT_GAS_URL;
+      if (activeGas) {
+        fetchDataFromGoogleSheets(false, activeGas);
       }
     };
+
     loadInitialData();
   }, []);
 
@@ -207,7 +235,7 @@ export default function App() {
       // Trigger background auto sync if not simulated offline
       if (!isSimulatedOffline) {
         syncDataWithServer();
-        syncDataWithSupabase();
+        syncDataWithGoogleSheets();
       }
     };
     const handleOffline = () => {
@@ -361,22 +389,27 @@ export default function App() {
   const handleCustomScan = (text: string) => {
     const normalizedText = text.trim();
     if (
+      normalizedText.includes('10nUmSSw_OIVKlm7vAZ-fK4LF_vx4CZKLQDH9kTxhLFE') ||
+      normalizedText.includes('docs.google.com/spreadsheets/d/10nUmSSw_OIVKlm7vAZ-fK4LF_vx4CZKLQDH9kTxhLFE') ||
       normalizedText.includes('docs.google.com/spreadsheets/d/1hpSmTKNZPfvopm_ZayB3KXibNF2CFLwnpqG-OC8WFvg') ||
       normalizedText.includes('1hpSmTKNZPfvopm_ZayB3KXibNF2CFLwnpqG-OC8WFvg') ||
+      normalizedText.includes('AKfycbxI024PKKAR0xvWgEOUBZzzyJz2zYbl6zzt41aLIQVvAzM9S5gVLAB_ucz2r5irlqch') ||
       normalizedText.includes('AKfycbz6aPZdwu1JSXxcqqpVTldZrpDEnWSGMuO-MiInBMnsmfxjUyaYr1F4NRCQ-o1vi21UnQ')
     ) {
-      const targetUrl = 'https://script.google.com/macros/s/AKfycbz6aPZdwu1JSXxcqqpVTldZrpDEnWSGMuO-MiInBMnsmfxjUyaYr1F4NRCQ-o1vi21UnQ/exec';
+      const targetUrl = normalizedText.includes('script.google.com')
+        ? normalizedText
+        : 'https://docs.google.com/spreadsheets/d/10nUmSSw_OIVKlm7vAZ-fK4LF_vx4CZKLQDH9kTxhLFE/edit';
       setGasUrl(targetUrl);
       localStorage.setItem('caninana_gas_url', targetUrl);
       
       addLog('QR Code lido com sucesso! Planilha Oficial da Caninana Auto Vidros conectada.', 'success', currentUser?.username || 'Sistema');
       
       playBeep('success');
-      alert('Planilha Caninana Auto Vidros vinculada via QR Code com sucesso! Sincronização iniciada.');
+      alert('Planilha Caninana Auto Vidros vinculada via QR Code com sucesso! Carregando catálogo...');
       
-      // Auto trigger sync
+      // Auto trigger sync with Google Sheets
       setTimeout(() => {
-        syncDataWithSupabase();
+        fetchDataFromGoogleSheets(true, targetUrl);
       }, 500);
       
       return true;
@@ -435,10 +468,8 @@ export default function App() {
 
     // Auto sync if online and online sync is active
     if (!isSimulatedOffline && isOnline) {
-      setTimeout(() => {
-        syncDataWithServer();
-        syncDataWithSupabase();
-      }, 500);
+      syncDataWithGoogleSheets([newMovement]);
+      syncDataWithServer();
     }
   };
 
@@ -469,7 +500,7 @@ export default function App() {
     if (!isSimulatedOffline && isOnline) {
       setTimeout(() => {
         syncDataWithServer();
-        syncDataWithSupabase();
+        syncDataWithGoogleSheets();
       }, 500);
     }
   };
@@ -502,6 +533,190 @@ export default function App() {
     }
     
     playBeep('error');
+  };
+
+  // Fetch products and inventory counts directly from Google Spreadsheet
+  const fetchDataFromGoogleSheets = async (showNotification = true, customUrl?: string) => {
+    const targetGasUrl = customUrl || gasUrl;
+    if (!targetGasUrl) {
+      if (showNotification) {
+        alert('Por favor, informe a URL do Google Apps Script nas configurações para buscar os dados da planilha.');
+      }
+      return false;
+    }
+
+    if (isSyncing) return false;
+    setIsSyncing(true);
+
+    try {
+      let resultData: any = null;
+
+      // 1. Tenta via backend proxy local para contornar restrições de CORS
+      try {
+        const resp = await fetch(getApiUrl('/api/sheets/fetch'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gasUrl: targetGasUrl })
+        });
+        const json = await resp.json();
+        if (json.success && json.data) {
+          resultData = json.data;
+        } else if (json.error) {
+          throw new Error(json.error);
+        }
+      } catch (proxyErr: any) {
+        // Se backend indisponível, tenta requisição direta
+        console.warn('Backend proxy indisponível, tentando chamada direta ao Google Apps Script:', proxyErr);
+        const directResp = await fetch(targetGasUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ action: 'fetch' }),
+          redirect: 'follow'
+        });
+        const directJson = await directResp.json();
+        if (directJson.success && directJson.data) {
+          resultData = directJson.data;
+        } else {
+          throw new Error(directJson.error || 'Erro ao carregar dados do Google Apps Script');
+        }
+      }
+
+      if (resultData) {
+        if (Array.isArray(resultData.products) && resultData.products.length > 0) {
+          setProducts(resultData.products);
+          localStorage.setItem('caninana_products', JSON.stringify(resultData.products));
+        }
+        if (Array.isArray(resultData.users) && resultData.users.length > 0) {
+          setUsers((prev) => {
+            const map = new Map(prev.map(u => [u.username, u]));
+            resultData.users.forEach((u: any) => {
+              if (u.username) {
+                map.set(u.username, {
+                  username: u.username,
+                  name: u.name || u.Nome || u.username,
+                  role: (u.role || u.Perfil || 'Operador') as any,
+                  email: u.email || '',
+                  passwordHash: u.passwordHash || '123'
+                });
+              }
+            });
+            return Array.from(map.values());
+          });
+        }
+
+        const count = resultData.products?.length || 0;
+        addLog(`Planilha Google conectada! ${count} produtos e saldos de estoque sincronizados.`, 'success', currentUser?.username || 'Sistema');
+        playBeep('success');
+        if (showNotification) {
+          alert(`Planilha Google conectada com sucesso!\n${count} produtos carregados.`);
+        }
+        return true;
+      }
+    } catch (err: any) {
+      console.error('Falha ao buscar dados da planilha Google:', err);
+      addLog(`Aviso na conexão com a planilha: ${err.message || 'Falha de rede'}.`, 'warning', currentUser?.username || 'Sistema');
+      if (showNotification) {
+        playBeep('warning');
+        alert(`Não foi possível conectar à Planilha Google.\n\nDetalhes: ${err.message}\n\nDica: Certifique-se de que o Apps Script foi implantado como "App da Web" com acesso para "Qualquer pessoa" (inclusive anônimos).`);
+      }
+      return false;
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Sync collected movements & inventory items with Google Spreadsheet
+  const syncDataWithGoogleSheets = async (customMovements?: Movement[], isManual = false) => {
+    if (isSyncing) return;
+    setIsSyncing(true);
+
+    const movsToSync = customMovements || movements.filter((m) => !m.synced);
+    const pendingInvs = inventory.filter((i) => !i.synced);
+    const unsyncedLogs = logs.filter((l) => l.id !== 'log_init');
+    const newProducts = products.filter((p) => !INITIAL_PRODUCTS.some((ip) => ip.barcode === p.barcode));
+
+    if (movsToSync.length === 0 && pendingInvs.length === 0 && !isManual) {
+      setIsSyncing(false);
+      return;
+    }
+
+    const payload = {
+      movements: movsToSync,
+      inventory: pendingInvs,
+      logs: unsyncedLogs,
+      newProducts: newProducts,
+      users: users
+    };
+
+    try {
+      let syncedSuccess = false;
+      let returnedData: any = null;
+
+      if (gasUrl) {
+        try {
+          // Via backend proxy
+          const resp = await fetch(getApiUrl('/api/sheets/sync'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gasUrl, payload })
+          });
+          const json = await resp.json();
+          if (json.success) {
+            syncedSuccess = true;
+            returnedData = json.data;
+          } else {
+            throw new Error(json.error);
+          }
+        } catch (proxyErr: any) {
+          // Fallback chamada direta com headers simples
+          console.warn('Backend proxy indisponível, enviando direto ao Google Apps Script:', proxyErr);
+          const directResp = await fetch(gasUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: 'sync', payload }),
+            redirect: 'follow'
+          });
+          const directJson = await directResp.json();
+          if (directJson.success) {
+            syncedSuccess = true;
+            returnedData = directJson.data;
+          } else {
+            throw new Error(directJson.error || 'Erro ao sincronizar');
+          }
+        }
+      }
+
+      if (syncedSuccess) {
+        const syncedIds = new Set(movsToSync.map(m => m.id));
+        setMovements((prev) => prev.map((m) => syncedIds.has(m.id) ? { ...m, synced: true } : m));
+        setInventory((prev) => prev.map((i) => ({ ...i, synced: true })));
+
+        if (returnedData && Array.isArray(returnedData.products) && returnedData.products.length > 0) {
+          setProducts(returnedData.products);
+        }
+
+        addLog(`Planilha Google atualizada com sucesso! ${movsToSync.length} mov. enviadas.`, 'success', currentUser?.username || 'Sistema');
+        playBeep('success');
+        if (isManual) {
+          alert('Planilha Google atualizada e sincronizada com sucesso!');
+        }
+      } else {
+        // Fallback: sincroniza com o banco local
+        await syncDataWithServer();
+        setMovements((prev) => prev.map((m) => ({ ...m, synced: true })));
+        setInventory((prev) => prev.map((i) => ({ ...i, synced: true })));
+        addLog(`Dados gravados em contingência local.`, 'info', currentUser?.username || 'Sistema');
+      }
+    } catch (err: any) {
+      console.error('Erro na sincronização:', err);
+      await syncDataWithServer();
+      addLog(`Aviso na sincronização: ${err.message}. Salvo localmente.`, 'warning', currentUser?.username || 'Sistema');
+      if (isManual) {
+        alert(`Erro na sincronização com a Planilha Google: ${err.message}`);
+      }
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   // Sync data with local database on the backend server
@@ -763,12 +978,12 @@ export default function App() {
           {/* Sync status indicator action */}
           <button
             id="header-quick-sync"
-            onClick={syncDataWithSupabase}
+            onClick={syncDataWithGoogleSheets}
             disabled={isSyncing}
             className={`w-8 h-8 rounded-lg border border-white/20 bg-white/10 flex items-center justify-center text-white/90 hover:text-white hover:bg-white/20 cursor-pointer active:scale-95 transition ${
               isSyncing ? 'animate-spin border-white' : ''
             }`}
-            title="Sincronizar dados agora"
+            title="Sincronizar com Planilha Google"
           >
             <CloudLightning size={14} />
           </button>
@@ -840,7 +1055,8 @@ export default function App() {
             logs={logs}
             user={currentUser}
             onClearDatabase={handleClearDatabase}
-            onSync={syncDataWithSupabase}
+            onSync={syncDataWithGoogleSheets}
+            onFetchSheets={() => fetchDataFromGoogleSheets(true)}
             isSyncing={isSyncing}
           />
         )}
@@ -850,7 +1066,7 @@ export default function App() {
       <nav id="coletor-bottom-nav" className="bg-white border-t border-slate-200 grid grid-cols-5 gap-1 pt-1.5 pb-6 px-3 fixed bottom-0 left-0 w-full z-40 shadow-md pb-[safe-area-inset-bottom]">
         {[
           { id: 'Dashboard', icon: LayoutDashboard, label: 'Painel' },
-          { id: 'Scanner', icon: Scan, label: 'Coleta' },
+          { id: 'Scanner', icon: Scan, label: 'Saída' },
           { id: 'Consulta', icon: Search, label: 'Consulta' },
           { id: 'Perfil', icon: UserIcon, label: 'Perfil' },
           { id: 'Config', icon: Settings, label: 'Sinc.' }

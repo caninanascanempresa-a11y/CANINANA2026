@@ -4,6 +4,9 @@
  */
 
 import express from 'express';
+import http from 'http';
+import https from 'https';
+import fs from 'fs';
 import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
@@ -13,7 +16,7 @@ import { getDatabase, saveDatabase, resetDatabase } from './server-db';
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 
 app.use(express.json());
 
@@ -330,6 +333,273 @@ app.post('/api/db/reset', (req, res) => {
   }
 });
 
+const CURRENT_SPREADSHEET_ID = '10nUmSSw_OIVKlm7vAZ-fK4LF_vx4CZKLQDH9kTxhLFE';
+
+// Parser utilitário de linhas CSV
+function parseCsvLine(text: string): string[] {
+  const result: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      if (inQuotes && text[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === ',' && !inQuotes) {
+      result.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
+// Busca produtos diretamente via CSV público da planilha Google (Aba Cadastro: gid=141012092)
+async function fetchProductsDirectFromSheet(spreadsheetId: string = CURRENT_SPREADSHEET_ID) {
+  const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=141012092`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Falha ao exportar CSV da planilha: HTTP ${res.status}`);
+  }
+  const text = await res.text();
+  const lines = text.split('\n');
+  const products: any[] = [];
+
+  for (let i = 4; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const cols = parseCsvLine(line);
+    const barcode = (cols[0] || '').trim();
+    if (!barcode) continue;
+
+    const description = (cols[1] || '').trim();
+    const category = (cols[2] || '').trim();
+    const application = (cols[3] || '').trim();
+    const location = (cols[4] || '').trim();
+    const stock = Number(cols[12] !== undefined && cols[12] !== '' ? cols[12] : (cols[5] || 0));
+    const minStock = Number(cols[6] || 3);
+
+    products.push({
+      barcode,
+      description,
+      category,
+      application,
+      location,
+      stock: isNaN(stock) ? 0 : stock,
+      minStock: isNaN(minStock) ? 3 : minStock
+    });
+  }
+
+  return products;
+}
+
+// Google Sheets: Fetch all data from Google Apps Script Web App or direct Google Sheet
+app.post('/api/sheets/fetch', async (req, res) => {
+  const rawGasUrl = (req.body?.gasUrl || process.env.GAS_URL || '').trim();
+  
+  // Se for uma URL direta da planilha Google ou se estiver vazia, puxa direto via CSV
+  const isDirectSheetUrl = rawGasUrl.includes('docs.google.com/spreadsheets');
+  const sheetIdMatch = rawGasUrl.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  const targetSheetId = sheetIdMatch ? sheetIdMatch[1] : CURRENT_SPREADSHEET_ID;
+
+  if (isDirectSheetUrl || !rawGasUrl) {
+    try {
+      console.log(`[Google Sheets] Importando produtos diretamente da planilha ID ${targetSheetId}...`);
+      const directProducts = await fetchProductsDirectFromSheet(targetSheetId);
+      const db = getDatabase();
+      if (directProducts.length > 0) {
+        db.products = directProducts;
+        saveDatabase(db);
+      }
+      return res.json({
+        success: true,
+        data: {
+          products: directProducts,
+          movements: db.movements,
+          inventory: db.inventory,
+          users: db.users,
+          source: 'direct_sheet_csv'
+        }
+      });
+    } catch (directErr: any) {
+      console.error('Falha ao importar diretamente da planilha Google:', directErr);
+      return res.status(500).json({ success: false, error: directErr.message || 'Erro ao ler dados da planilha.' });
+    }
+  }
+
+  // Caso seja a URL do Google Apps Script Web App
+  try {
+    const fetchResponse = await fetch(rawGasUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'fetch' }),
+      redirect: 'follow',
+    });
+
+    const text = await fetchResponse.text();
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      // Se deu erro de login no Apps Script, tenta o fallback direto da planilha pública!
+      console.warn('[Google Sheets] Web App requer login. Executando fallback direto na planilha...');
+      try {
+        const directProducts = await fetchProductsDirectFromSheet(CURRENT_SPREADSHEET_ID);
+        const db = getDatabase();
+        if (directProducts.length > 0) {
+          db.products = directProducts;
+          saveDatabase(db);
+        }
+        return res.json({
+          success: true,
+          data: {
+            products: directProducts,
+            movements: db.movements,
+            inventory: db.inventory,
+            users: db.users,
+            fallbackUsed: true
+          }
+        });
+      } catch (e) {
+        return res.status(401).json({
+          success: false,
+          error: 'A planilha requer login do Google. Implante o Apps Script com permissão "Qualquer pessoa" (Anyone) com acesso público.',
+          raw: text.slice(0, 200)
+        });
+      }
+    }
+
+    if (data.success && data.data) {
+      const db = getDatabase();
+      if (Array.isArray(data.data.products) && data.data.products.length > 0) {
+        db.products = data.data.products;
+      }
+      if (Array.isArray(data.data.movements) && data.data.movements.length > 0) {
+        const existingIds = new Set(db.movements.map(m => m.id));
+        data.data.movements.forEach((m: any) => {
+          if (!existingIds.has(m.id)) {
+            db.movements.push(m);
+          }
+        });
+      }
+      saveDatabase(db);
+      return res.json({ success: true, data: data.data });
+    }
+
+    res.status(400).json({ success: false, error: data.error || 'Erro ao buscar dados da planilha.' });
+  } catch (error: any) {
+    console.error('Error fetching from Google Sheets:', error);
+    // Tentativa final de fallback
+    try {
+      const directProducts = await fetchProductsDirectFromSheet(CURRENT_SPREADSHEET_ID);
+      const db = getDatabase();
+      if (directProducts.length > 0) {
+        db.products = directProducts;
+        saveDatabase(db);
+      }
+      return res.json({
+        success: true,
+        data: {
+          products: directProducts,
+          movements: db.movements,
+          inventory: db.inventory,
+          users: db.users
+        }
+      });
+    } catch {
+      res.status(500).json({ success: false, error: error.message || 'Falha de comunicação com a planilha Google.' });
+    }
+  }
+});
+
+// Google Sheets: Sync local offline collections (movements, inventory, logs, products) to spreadsheet
+app.post('/api/sheets/sync', async (req, res) => {
+  const { gasUrl: incomingUrl, payload } = req.body;
+  const rawGasUrl = (incomingUrl || process.env.GAS_URL || '').trim();
+
+  // Se o usuário passou a URL do Google Sheets (e não a URL do Apps Script .exec)
+  if (rawGasUrl.includes('docs.google.com/spreadsheets')) {
+    // Salva tudo localmente no banco do servidor
+    const db = getDatabase();
+    if (payload?.movements && Array.isArray(payload.movements)) {
+      payload.movements.forEach((mov: any) => {
+        if (!db.movements.some(m => m.id === mov.id)) {
+          db.movements.push({ ...mov, synced: true });
+        }
+      });
+    }
+    if (payload?.inventory && Array.isArray(payload.inventory)) {
+      payload.inventory.forEach((inv: any) => {
+        const exIdx = db.inventory.findIndex(i => i.barcode === inv.barcode && !i.synced);
+        if (exIdx > -1) {
+          db.inventory[exIdx].countedQuantity += inv.countedQuantity;
+        } else {
+          db.inventory.push({ ...inv, synced: true });
+        }
+      });
+    }
+    saveDatabase(db);
+
+    return res.json({
+      success: true,
+      data: {
+        products: db.products,
+        movements: db.movements,
+        inventory: db.inventory
+      },
+      message: 'Coletas salvas com sucesso no banco de dados local! Para gravar as linhas diretamente na planilha online, copie e implante o código do Apps Script (aba Sinc) e informe a URL do Web App gerada.'
+    });
+  }
+
+  if (!rawGasUrl) {
+    return res.status(400).json({ success: false, error: 'URL do Google Apps Script não fornecida.' });
+  }
+
+  try {
+    const syncResponse = await fetch(rawGasUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action: 'sync', payload: payload || {} }),
+      redirect: 'follow',
+    });
+
+    const text = await syncResponse.text();
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      if (text.includes('accounts.google.com') || text.includes('ServiceLogin')) {
+        return res.status(401).json({
+          success: false,
+          error: 'A planilha requer login do Google. Implante o Apps Script com permissão "Qualquer pessoa" (Anyone) com acesso público.',
+          raw: text.slice(0, 200)
+        });
+      }
+      return res.status(502).json({ success: false, error: 'Resposta inválida recebida do Google Apps Script.', raw: text.slice(0, 200) });
+    }
+
+    if (data.success && data.data) {
+      const db = getDatabase();
+      if (Array.isArray(data.data.products) && data.data.products.length > 0) {
+        db.products = data.data.products;
+      }
+      saveDatabase(db);
+      return res.json({ success: true, data: data.data });
+    }
+
+    res.status(400).json({ success: false, error: data.error || 'Erro ao sincronizar com a planilha.' });
+  } catch (error: any) {
+    console.error('Error syncing with Google Sheets:', error);
+    res.status(500).json({ success: false, error: error.message || 'Falha de comunicação com a planilha Google.' });
+  }
+});
+
 // GitHub Integration Backup Endpoint
 app.post('/api/db/github-backup', async (req, res) => {
   try {
@@ -408,9 +678,24 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Caninana Backend] Express server running on port ${PORT}`);
+  // Start standard HTTP server
+  http.createServer(app).listen(PORT, '0.0.0.0', () => {
+    console.log(`[Caninana Backend] HTTP server running on port ${PORT}`);
   });
+
+  // Start secure HTTPS server for camera access on mobile devices
+  const certPath = path.join(process.cwd(), 'cert.pem');
+  const keyPath = path.join(process.cwd(), 'key.pem');
+  if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    const httpsOptions = {
+      cert: fs.readFileSync(certPath),
+      key: fs.readFileSync(keyPath)
+    };
+    const HTTPS_PORT = PORT + 1; // 3002
+    https.createServer(httpsOptions, app).listen(HTTPS_PORT, '0.0.0.0', () => {
+      console.log(`[Caninana Backend] HTTPS Secure Camera server running on port ${HTTPS_PORT}`);
+    });
+  }
 }
 
 startServer();

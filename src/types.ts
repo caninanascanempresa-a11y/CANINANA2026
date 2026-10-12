@@ -29,6 +29,10 @@ export interface Movement {
   quantity: number;
   originLocation?: string;
   destinationLocation?: string;
+  destination?: 'Oficina' | 'Balcão' | 'Mercado Livre' | 'Outros' | string;
+  orderNumber?: string;
+  requester?: string;
+  notes?: string;
   date: string;
   user: string;
   synced: boolean;

@@ -41,6 +41,10 @@ export default function DashboardTab({ products, movements, inventory, logs, use
   const pendingSyncMovements = movements.filter((m) => !m.synced).length;
   const pendingSyncInventory = inventory.filter((i) => !i.synced).length;
 
+  // Saídas Diárias Focus
+  const saidasMovements = movements.filter((m) => m.type === 'Saída');
+  const totalSaidasQty = saidasMovements.reduce((acc, m) => acc + m.quantity, 0);
+
   // Top products (most moved in last movements)
   const getTopProducts = () => {
     const counts: Record<string, number> = {};
@@ -181,28 +185,81 @@ export default function DashboardTab({ products, movements, inventory, logs, use
       )}
 
       {/* Grid of Cards */}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-3 gap-2.5">
         {/* Card 1: Total SKUs */}
-        <div id="stat-card-sku" className="bg-white border border-slate-200 p-4 rounded-xl shadow-sm">
+        <div id="stat-card-sku" className="bg-white border border-slate-200 p-3 rounded-xl shadow-sm">
           <div className="flex justify-between items-start text-slate-400 mb-1">
-            <span className="text-[10px] font-bold tracking-wider uppercase font-mono">Total SKUs</span>
-            <Package size={16} className="text-[#2497DE]" />
+            <span className="text-[9px] font-bold tracking-wider uppercase font-mono">Total SKUs</span>
+            <Package size={14} className="text-[#2497DE]" />
           </div>
-          <div className="text-2xl font-black text-slate-800 font-mono">{totalProductsCount}</div>
-          <p className="text-[9px] text-slate-400 mt-1">Vidros cadastrados</p>
+          <div className="text-xl font-black text-slate-800 font-mono">{totalProductsCount}</div>
+          <p className="text-[9px] text-slate-400 mt-0.5">Vidros na base</p>
         </div>
 
-        {/* Card 2: Low Stock */}
-        <div id="stat-card-low-stock" className={`border p-4 rounded-xl transition shadow-sm ${lowStockProducts.length > 0 ? 'bg-amber-500/5 border-amber-500/20' : 'bg-white border-slate-200'}`}>
-          <div className="flex justify-between items-start text-slate-400 mb-1">
-            <span className="text-[10px] font-bold tracking-wider uppercase font-mono">Estoque Baixo</span>
-            <AlertTriangle size={16} className={lowStockProducts.length > 0 ? 'text-amber-500 animate-bounce' : 'text-slate-300'} />
+        {/* Card 2: Saídas Realizadas (FOCO PRINCIPAL) */}
+        <div id="stat-card-saidas" className="bg-red-50 border border-red-200 p-3 rounded-xl shadow-sm">
+          <div className="flex justify-between items-start text-red-500 mb-1">
+            <span className="text-[9px] font-bold tracking-wider uppercase font-mono">Saídas</span>
+            <TrendingUp size={14} className="text-red-600 rotate-180" />
           </div>
-          <div className={`text-2xl font-black font-mono ${lowStockProducts.length > 0 ? 'text-amber-600' : 'text-slate-400'}`}>
+          <div className="text-xl font-black text-red-700 font-mono">-{totalSaidasQty}</div>
+          <p className="text-[9px] text-red-600/80 font-bold mt-0.5">{saidasMovements.length} baixas</p>
+        </div>
+
+        {/* Card 3: Low Stock */}
+        <div id="stat-card-low-stock" className={`border p-3 rounded-xl transition shadow-sm ${lowStockProducts.length > 0 ? 'bg-amber-500/5 border-amber-500/20' : 'bg-white border-slate-200'}`}>
+          <div className="flex justify-between items-start text-slate-400 mb-1">
+            <span className="text-[9px] font-bold tracking-wider uppercase font-mono">Estoque Baixo</span>
+            <AlertTriangle size={14} className={lowStockProducts.length > 0 ? 'text-amber-500 animate-bounce' : 'text-slate-300'} />
+          </div>
+          <div className={`text-xl font-black font-mono ${lowStockProducts.length > 0 ? 'text-amber-600' : 'text-slate-400'}`}>
             {lowStockProducts.length}
           </div>
-          <p className="text-[9px] text-slate-400 mt-1">Abaixo do nível mínimo</p>
+          <p className="text-[9px] text-slate-400 mt-0.5">Reposição</p>
         </div>
+      </div>
+
+      {/* HISTÓRICO RECENTE DE SAÍDAS DIÁRIAS */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-3">
+        <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-red-600"></span>
+            <h4 className="text-xs font-bold text-slate-800 uppercase font-mono tracking-wider">
+              Últimas Saídas Diárias
+            </h4>
+          </div>
+          <span className="text-[10px] font-mono text-slate-400 font-bold">{saidasMovements.length} registradas</span>
+        </div>
+
+        {saidasMovements.length === 0 ? (
+          <p className="text-xs text-slate-400 py-3 text-center">Nenhuma saída de peça registrada nesta sessão ainda.</p>
+        ) : (
+          <div className="space-y-2 max-h-56 overflow-y-auto">
+            {saidasMovements.slice(-5).reverse().map((mov) => {
+              const prod = products.find((p) => p.barcode === mov.barcode);
+              return (
+                <div key={mov.id} className="bg-slate-50 border border-slate-100 p-2.5 rounded-xl flex items-center justify-between">
+                  <div className="min-w-0 pr-2">
+                    <div className="text-xs font-bold text-slate-800 truncate">
+                      {prod ? prod.description : `Cód: ${mov.barcode}`}
+                    </div>
+                    <div className="text-[10px] text-slate-400 font-mono mt-0.5 flex items-center gap-2">
+                      <span>Cód: <strong>{mov.barcode}</strong></span>
+                      <span>•</span>
+                      <span className="text-red-600 font-bold">Destino: {mov.destination || 'Oficina'}</span>
+                      {mov.orderNumber && <span>• OS: {mov.orderNumber}</span>}
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <span className="bg-red-100 text-red-700 font-bold font-mono text-xs px-2 py-0.5 rounded-lg">
+                      -{mov.quantity} un
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Real-time stock audit list if low stock items exist */}

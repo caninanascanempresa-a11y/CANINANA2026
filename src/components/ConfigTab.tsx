@@ -40,6 +40,7 @@ interface ConfigTabProps {
   user: User;
   onClearDatabase: () => void;
   onSync: () => Promise<void>;
+  onFetchSheets?: () => Promise<boolean | void> | void;
   isSyncing: boolean;
 }
 
@@ -56,11 +57,13 @@ export default function ConfigTab({
   user,
   onClearDatabase,
   onSync,
+  onFetchSheets,
   isSyncing
 }: ConfigTabProps) {
   const [activeTab, setActiveTab] = useState<'Produtos' | 'Movimentações' | 'Inventário' | 'Logs'>('Produtos');
   const [copied, setCopied] = useState(false);
   const [resetConfirm, setResetConfirm] = useState(false);
+  const [isFetchingSheets, setIsFetchingSheets] = useState(false);
 
   // GitHub Backup configuration states
   const [githubToken, setGithubToken] = useState(() => localStorage.getItem('caninana_github_token') || '');
@@ -183,9 +186,19 @@ export default function ConfigTab({
       
       {/* CONNECTION STATUS & GOOGLE SPREADSHEET SETUP */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-4 shadow-sm">
-        <div className="flex items-center gap-2 border-b border-slate-100 pb-2.5">
-          <FileSpreadsheet className="text-[#2497DE]" size={18} />
-          <h3 className="text-xs font-bold text-slate-800 uppercase font-mono tracking-wider">Planilha Google Sheets</h3>
+        <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+          <div className="flex items-center gap-2">
+            <FileSpreadsheet className="text-[#2497DE]" size={18} />
+            <h3 className="text-xs font-bold text-slate-800 uppercase font-mono tracking-wider">Planilha Google Sheets</h3>
+          </div>
+          <a
+            href="https://docs.google.com/spreadsheets/d/10nUmSSw_OIVKlm7vAZ-fK4LF_vx4CZKLQDH9kTxhLFE/edit"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-[10px] text-[#2497DE] hover:underline font-bold font-mono flex items-center gap-1 bg-sky-50 px-2 py-1 rounded border border-sky-100"
+          >
+            Abrir Planilha Oficial
+          </a>
         </div>
 
         <div className="space-y-3">
@@ -200,6 +213,27 @@ export default function ConfigTab({
               onChange={(e) => setGasUrl(e.target.value)}
             />
           </div>
+
+          {/* Quick Button to Fetch Sheets Data */}
+          <button
+            id="fetch-sheets-data-btn"
+            type="button"
+            onClick={async () => {
+              if (onFetchSheets) {
+                setIsFetchingSheets(true);
+                try {
+                  await onFetchSheets();
+                } finally {
+                  setIsFetchingSheets(false);
+                }
+              }
+            }}
+            disabled={isFetchingSheets || isSyncing}
+            className="w-full bg-slate-100 hover:bg-slate-200 text-slate-700 py-2.5 rounded-xl font-bold text-[11px] transition cursor-pointer flex items-center justify-center gap-2 border border-slate-200 disabled:opacity-50"
+          >
+            <Download size={14} className={isFetchingSheets ? 'animate-bounce' : ''} />
+            {isFetchingSheets ? 'PUXANDO DADOS DA PLANILHA...' : 'PUXAR CATÁLOGO & ESTOQUES DA PLANILHA'}
+          </button>
 
           <div>
             <label className="block text-slate-400 text-[10px] uppercase font-bold tracking-wider mb-1 font-mono">Endereço do Servidor Backend Local (Computador)</label>
@@ -231,8 +265,6 @@ export default function ConfigTab({
               )}
             </div>
           </div>
-
-
         </div>
       </div>
 

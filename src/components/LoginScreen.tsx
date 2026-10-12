@@ -42,8 +42,38 @@ export default function LoginScreen({ onLogin, users = [], onAddUserLocal }: Log
     const typedUser = username.trim().toLowerCase();
     const typedPass = password;
 
+    // 1. First check local users database (or default admin)
+    const found = users.find(
+      (u) => u.username.toLowerCase() === typedUser && u.passwordHash === typedPass
+    );
+
+    if (found) {
+      playBeep('success');
+      onLogin({
+        username: found.username,
+        name: found.name,
+        role: found.role,
+        email: found.email,
+        avatar: found.avatar,
+      });
+      setLoading(false);
+      return;
+    } else if (typedUser === 'admin' && typedPass === '123') {
+      // Default admin access
+      playBeep('success');
+      onLogin({
+        username: 'admin',
+        name: 'Administrador Caninana',
+        role: 'Administrador',
+        email: 'carlos@caninana.com.br',
+        avatar: ''
+      });
+      setLoading(false);
+      return;
+    }
+
+    // 2. Fallback to Supabase only if online and table exists
     try {
-      // 1. Try to query directly from Supabase for real-time validation if online
       const { data: remoteUser, error: queryErr } = await supabase
         .from('users')
         .select('*')
@@ -70,37 +100,11 @@ export default function LoginScreen({ onLogin, users = [], onAddUserLocal }: Log
         }
       }
     } catch (err) {
-      console.warn('Supabase connection or query failed, using offline fallback.');
+      // Ignore Supabase connection errors
     }
 
-    // 2. Offline Contingency: Fallback to the local memory/cached users database or initial default login
-    const found = users.find(
-      (u) => u.username.toLowerCase() === typedUser && u.passwordHash === typedPass
-    );
-
-    if (found) {
-      playBeep('success');
-      onLogin({
-        username: found.username,
-        name: found.name,
-        role: found.role,
-        email: found.email,
-        avatar: found.avatar,
-      });
-    } else if (typedUser === 'admin' && typedPass === '123') {
-      // Guarantee entry for first-time use if Supabase tables aren't created yet
-      playBeep('success');
-      onLogin({
-        username: 'admin',
-        name: 'Administrador Caninana',
-        role: 'Administrador',
-        email: 'carlos@caninana.com.br',
-        avatar: ''
-      });
-    } else {
-      setError('Usuário não cadastrado localmente ou senha incorreta.');
-      playBeep('error');
-    }
+    setError('Usuário não encontrado ou senha incorreta. Use admin / 123 ou crie uma conta.');
+    playBeep('error');
     setLoading(false);
   };
 
@@ -127,9 +131,31 @@ export default function LoginScreen({ onLogin, users = [], onAddUserLocal }: Log
 
     const cleanUsername = regUsername.trim().toLowerCase();
 
+    // Check if username already exists locally
+    if (users.some((u) => u.username.toLowerCase() === cleanUsername)) {
+      setError('Este nome de usuário já está cadastrado.');
+      playBeep('error');
+      setLoading(false);
+      return;
+    }
+
+    const newUserObject = {
+      username: cleanUsername,
+      name: regName.trim(),
+      role: regRole,
+      email: regEmail.trim(),
+      avatar: '',
+      passwordHash: regPassword
+    };
+
+    // 1. Always register user locally first (100% works offline/online)
+    if (onAddUserLocal) {
+      onAddUserLocal(newUserObject);
+    }
+
+    // 2. Try to sync to Supabase in background without blocking the user
     try {
-      // Try pushing to Supabase first
-      const { error: insertErr } = await supabase
+      await supabase
         .from('users')
         .insert({
           username: cleanUsername,
@@ -138,79 +164,23 @@ export default function LoginScreen({ onLogin, users = [], onAddUserLocal }: Log
           email: regEmail.trim() || '',
           password_hash: regPassword
         });
-
-      if (insertErr) {
-        // If the table 'users' does not exist in Supabase yet, do NOT block the user.
-        // Fall back to registering the user locally so they can use the app immediately!
-        if (
-          insertErr.message?.includes('public.users') || 
-          insertErr.code === 'PGRST116' || 
-          insertErr.message?.includes('schema cache') ||
-          insertErr.message?.includes('relation')
-        ) {
-          if (onAddUserLocal) {
-            onAddUserLocal({
-              username: cleanUsername,
-              name: regName.trim(),
-              role: regRole,
-              email: regEmail.trim(),
-              passwordHash: regPassword
-            });
-          }
-          playBeep('success');
-          setSuccess('Aviso: Rodando Local (Tabela Supabase ausente). Usuário registrado com sucesso!');
-          
-          setRegName('');
-          setRegUsername('');
-          setRegEmail('');
-          setRegPassword('');
-          setRegConfirmPassword('');
-          
-          setTimeout(() => {
-            setIsRegisterMode(false);
-            setSuccess('');
-          }, 1500);
-          return;
-        }
-
-        if (insertErr.code === '23505') {
-          throw new Error('Este nome de usuário já está cadastrado.');
-        }
-        throw insertErr;
-      }
-
-      // If Supabase insert succeeded
-      if (onAddUserLocal) {
-        onAddUserLocal({
-          username: cleanUsername,
-          name: regName.trim(),
-          role: regRole,
-          email: regEmail.trim(),
-          passwordHash: regPassword
-        });
-      }
-
-      playBeep('success');
-      setSuccess('Usuário cadastrado com sucesso! Faça seu login.');
-      
-      setRegName('');
-      setRegUsername('');
-      setRegEmail('');
-      setRegPassword('');
-      setRegConfirmPassword('');
-      
-      setTimeout(() => {
-        setIsRegisterMode(false);
-        setSuccess('');
-      }, 1500);
-
-    } catch (err: any) {
-      console.error('Registration failed:', err);
-      setError(err.message || 'Erro ao registrar usuário no Supabase.');
-      playBeep('error');
-    } finally {
-      setLoading(false);
+    } catch (supaErr) {
+      // Supabase is optional; ignore network/schema failures
     }
+
+    playBeep('success');
+    setSuccess('Usuário cadastrado com sucesso! Faça seu login.');
+    
+    setRegName('');
+    setRegUsername('');
+    setRegEmail('');
+    setRegPassword('');
+    setRegConfirmPassword('');
+    
+    setTimeout(() => {
+      setIsRegisterMode(false);
+      setSuccess('');
+    }, 1200);
   };
 
   return (
@@ -285,6 +255,48 @@ export default function LoginScreen({ onLogin, users = [], onAddUserLocal }: Log
               <Shield size={14} />
               {loading ? 'Autenticando...' : 'Autenticar Dispositivo'}
             </button>
+
+            <div className="pt-2 border-t border-slate-150">
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider text-center mb-2">Entrar rápido (Testes):</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsername('admin');
+                    setPassword('123');
+                    setError('');
+                  }}
+                  className="px-2 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold transition"
+                >
+                  👑 Admin (123)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsername('operador');
+                    setPassword('123');
+                    setError('');
+                  }}
+                  className="px-2 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold transition"
+                >
+                  👷 Operador (123)
+                </button>
+              </div>
+
+              <div className="mt-2 text-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    localStorage.clear();
+                    window.location.reload();
+                  }}
+                  className="text-[10px] text-slate-400 hover:text-red-500 font-mono transition"
+                  title="Limpa cache e dados do navegador"
+                >
+                  🧹 Zerar cache e histórico do navegador
+                </button>
+              </div>
+            </div>
 
             <div className="text-center pt-2">
               <button

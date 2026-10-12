@@ -33,7 +33,12 @@ interface ScannerTabProps {
 }
 
 export default function ScannerTab({ products, onAddProduct, onAddMovement, onAddInventoryItem, user, onCustomScan, getApiUrl }: ScannerTabProps) {
-  const [scanMode, setScanMode] = useState<'Entrada' | 'Saída' | 'Transferência' | 'Inventário'>('Inventário');
+  const [scanMode, setScanMode] = useState<'Saída' | 'Entrada' | 'Inventário'>('Saída');
+  const [destination, setDestination] = useState<'Oficina' | 'Balcão' | 'Mercado Livre' | 'Outros'>('Oficina');
+  const [orderNumber, setOrderNumber] = useState('');
+  const [requester, setRequester] = useState('');
+  const [lastRegisteredSaida, setLastRegisteredSaida] = useState<{ barcode: string; description: string; qty: number; destination: string; time: string } | null>(null);
+
   const [isContinuous, setIsContinuous] = useState(true);
   const [quantity, setQuantity] = useState(1);
   const [originLocation, setOriginLocation] = useState('Geral');
@@ -71,10 +76,45 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
     }
   };
 
-  const startCamera = async () => {
+  const [cameras, setCameras] = useState<{ id: string; label: string }[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string>('');
+
+  // Discover available cameras
+  const discoverCameras = async () => {
+    try {
+      const devices = await Html5Qrcode.getCameras();
+      if (devices && devices.length > 0) {
+        setCameras(devices);
+        // Prefer back camera if found
+        const backCam = devices.find(d => 
+          d.label.toLowerCase().includes('back') || 
+          d.label.toLowerCase().includes('traseira') || 
+          d.label.toLowerCase().includes('rear') ||
+          d.label.toLowerCase().includes('environment')
+        );
+        setSelectedCameraId(backCam ? backCam.id : devices[0].id);
+      }
+    } catch (e) {
+      console.warn("Could not list cameras:", e);
+    }
+  };
+
+  useEffect(() => {
+    discoverCameras();
+  }, []);
+
+  const startCamera = async (overrideCameraId?: string) => {
     setScannerError(null);
     try {
       setScannerActive(true);
+      
+      // Stop existing instance if running
+      if (html5QrcodeRef.current && html5QrcodeRef.current.isScanning) {
+        try {
+          await html5QrcodeRef.current.stop();
+        } catch (e) {}
+      }
+
       const html5Qrcode = new Html5Qrcode(scannerId);
       html5QrcodeRef.current = html5Qrcode;
 
@@ -83,13 +123,12 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
       };
 
       const config = { 
-        fps: 25, 
+        fps: 30, 
         qrbox: (width: number, height: number) => {
-          // Square scan area for perfect QR Code and barcode capture
-          const size = Math.floor(Math.min(width, height) * 0.75);
+          // Optimized scanning window for instant detection
           return {
-            width: size,
-            height: size
+            width: Math.floor(Math.min(width, height) * 0.85),
+            height: Math.floor(Math.min(width, height) * 0.85)
           };
         },
         experimentalFeatures: {
@@ -97,16 +136,47 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
         }
       };
 
-      // Try back camera first
-      await html5Qrcode.start(
-        { facingMode: "environment" },
-        config,
-        qrCodeSuccessCallback,
-        undefined
-      );
+      const camToUse = overrideCameraId || selectedCameraId;
+
+      if (camToUse) {
+        await html5Qrcode.start(
+          camToUse,
+          config,
+          qrCodeSuccessCallback,
+          undefined
+        );
+      } else {
+        // Fallback to facingMode: environment
+        try {
+          await html5Qrcode.start(
+            { facingMode: "environment" },
+            config,
+            qrCodeSuccessCallback,
+            undefined
+          );
+        } catch (facingErr) {
+          // Fallback to user facing (front camera)
+          await html5Qrcode.start(
+            { facingMode: "user" },
+            config,
+            qrCodeSuccessCallback,
+            undefined
+          );
+        }
+      }
+
+      // Re-fetch cameras list once permission is granted
+      discoverCameras();
     } catch (err: any) {
       console.error("Camera start failed:", err);
-      setScannerError("Câmera não disponível ou permissão negada. Use o Simulador de Código de Barras abaixo.");
+      const isHttps = window.location.protocol === 'https:';
+      let msg = "Acesso à câmera não liberado pelo celular.";
+      if (!isHttps) {
+        msg = "⚠️ Atenção: A câmera do celular só funciona pelo endereço seguro HTTPS! Acesse https://" + window.location.hostname + ":3002 ou use a digitação rápida abaixo.";
+      } else if (err?.name === 'NotAllowedError' || err?.message?.includes('denied') || err?.message?.includes('Permission')) {
+        msg = "Permissão da câmera negada no celular! Toque no ícone de cadeado / configurações do site no topo do navegador e marque 'Permitir Câmera'.";
+      }
+      setScannerError(msg);
       setScannerActive(false);
     }
   };
@@ -132,19 +202,28 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
     };
   }, []);
 
+  const lastScannedCodeRef = useRef<{ code: string; time: number }>({ code: '', time: 0 });
+
   // Handle successful barcode scan (Real or Simulated)
   const handleBarcodeScanned = (barcode: string) => {
     const code = barcode.trim();
     if (!code) return;
+
+    // Fast anti-double-scan debounce (1.2 seconds for identical code)
+    const now = Date.now();
+    if (lastScannedCodeRef.current.code === code && now - lastScannedCodeRef.current.time < 1200) {
+      return;
+    }
+    lastScannedCodeRef.current = { code, time: now };
 
     // Check for custom scans (e.g. spreadsheet configuration link)
     if (onCustomScan && onCustomScan(code)) {
       return;
     }
 
-    // Beep & flash UI
+    // Beep & flash UI instantly
     setFlashSuccess(true);
-    setTimeout(() => setFlashSuccess(false), 300);
+    setTimeout(() => setFlashSuccess(false), 200);
 
     const product = products.find((p) => p.barcode === code);
 
@@ -187,21 +266,34 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
         description: product ? product.description : 'Produto Novo',
         countedQuantity: qty,
         date: timestamp,
-        user: user.username,
+        user: user.name || user.username,
         synced: false,
       });
     } else {
       onAddMovement({
         id: 'mov_' + Math.random().toString(36).substr(2, 9),
         barcode: code,
-        type: scanMode === 'Transferência' ? 'Transferência' : (scanMode as any),
+        type: scanMode as any,
         quantity: qty,
-        originLocation: scanMode === 'Transferência' ? originLocation : undefined,
-        destinationLocation: scanMode === 'Transferência' || scanMode === 'Entrada' ? destinationLocation : undefined,
+        destination: scanMode === 'Saída' ? destination : undefined,
+        orderNumber: scanMode === 'Saída' ? (orderNumber || undefined) : undefined,
+        requester: scanMode === 'Saída' ? (requester || undefined) : undefined,
+        originLocation: originLocation || undefined,
+        destinationLocation: destinationLocation || undefined,
         date: timestamp,
-        user: user.username,
+        user: user.name || user.username,
         synced: false,
       });
+
+      if (scanMode === 'Saída') {
+        setLastRegisteredSaida({
+          barcode: code,
+          description: product ? product.description : 'Item ' + code,
+          qty,
+          destination,
+          time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        });
+      }
     }
 
     // Reset scan wizard
@@ -269,28 +361,115 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
   return (
     <div id="scanner-tab-container" className="p-4 max-w-lg mx-auto pb-24 space-y-4">
       
-      {/* MODE SELECTOR */}
-      <div id="mode-selector" className="bg-slate-100 p-1 rounded-xl border border-slate-200 grid grid-cols-4 gap-1">
-        {(['Entrada', 'Saída', 'Transferência', 'Inventário'] as const).map((mode) => (
-          <button
-            key={mode}
-            id={`mode-btn-${mode.toLowerCase()}`}
-            onClick={() => {
-              setScanMode(mode);
-            }}
-            className={`py-2 px-1 rounded-lg text-[10px] font-bold uppercase tracking-wider font-mono text-center cursor-pointer transition-all ${
-              scanMode === mode 
-                ? 'bg-[#2497DE] text-white shadow-sm' 
-                : 'text-slate-500 hover:text-slate-800'
-            }`}
-          >
-            {mode === 'Entrada' && 'Entrada'}
-            {mode === 'Saída' && 'Saída'}
-            {mode === 'Transferência' && 'Transf.'}
-            {mode === 'Inventário' && 'Invent.'}
-          </button>
-        ))}
+      {/* FOCUSED SAÍDA HEADER & DESTINATION PICKER */}
+      <div className="bg-white border-2 border-red-200 rounded-2xl p-4 shadow-sm space-y-3 bg-gradient-to-b from-red-50/40 to-white">
+        <div className="flex items-center justify-between border-b border-red-100 pb-2">
+          <div className="flex items-center gap-2">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-600 animate-pulse"></span>
+            <span className="text-xs font-black tracking-wider uppercase font-mono text-red-700">
+              Operação de Saída de Peças
+            </span>
+          </div>
+          <span className="text-[10px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-bold font-mono">
+            SAÍDAS DIÁRIAS
+          </span>
+        </div>
+
+        {/* Destino da Saída (Oficina, Balcão, Mercado Livre, Outros) */}
+        <div>
+          <label className="block text-slate-500 text-[10px] uppercase font-bold tracking-wider mb-1.5 font-mono">
+            Destino da Peça:
+          </label>
+          <div className="grid grid-cols-4 gap-1.5">
+            {(['Oficina', 'Balcão', 'Mercado Livre', 'Outros'] as const).map((dest) => (
+              <button
+                key={dest}
+                type="button"
+                onClick={() => setDestination(dest)}
+                className={`py-2 px-1 rounded-xl text-[10px] font-bold font-mono text-center cursor-pointer transition-all ${
+                  destination === dest
+                    ? 'bg-red-600 text-white shadow-sm scale-102 font-black'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200'
+                }`}
+              >
+                {dest}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* OS / Pedido & Solicitante Opcionais */}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          <div>
+            <label className="block text-slate-400 text-[9px] uppercase font-bold font-mono mb-1">
+              OS / Pedido (Opcional)
+            </label>
+            <input
+              type="text"
+              placeholder="Ex: OS 1045"
+              value={orderNumber}
+              onChange={(e) => setOrderNumber(e.target.value)}
+              className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2 text-xs text-slate-800 font-mono focus:outline-none focus:border-red-500"
+            />
+          </div>
+          <div>
+            <label className="block text-slate-400 text-[9px] uppercase font-bold font-mono mb-1">
+              Solicitante (Opcional)
+            </label>
+            <input
+              type="text"
+              placeholder="Ex: Mecânico / Jullyana"
+              value={requester}
+              onChange={(e) => setRequester(e.target.value)}
+              className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2 text-xs text-slate-800 font-mono focus:outline-none focus:border-red-500"
+            />
+          </div>
+        </div>
+
+        {/* Quantidade por Bipe */}
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-slate-500 text-[10px] uppercase font-bold font-mono">Qtd por Bipe:</span>
+          <div className="flex items-center gap-1.5">
+            {[1, 2, 5].map((q) => (
+              <button
+                key={q}
+                type="button"
+                onClick={() => setQuantity(q)}
+                className={`w-7 h-7 rounded-lg text-xs font-bold font-mono transition cursor-pointer ${
+                  quantity === q
+                    ? 'bg-red-600 text-white'
+                    : 'bg-slate-100 text-slate-600 border border-slate-200'
+                }`}
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
+
+      {/* FEEDBACK DA ÚLTIMA SAÍDA REGISTRADA */}
+      {lastRegisteredSaida && (
+        <div className="bg-emerald-50 border border-emerald-300 rounded-xl p-3 flex items-start gap-2.5 text-xs text-emerald-900 animate-fade-in shadow-sm">
+          <Check size={18} className="text-emerald-600 shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="flex justify-between items-center">
+              <span className="font-bold text-emerald-800 uppercase font-mono text-[10px]">
+                Saída Registrada com Sucesso!
+              </span>
+              <span className="text-[9px] font-mono text-emerald-600">{lastRegisteredSaida.time}</span>
+            </div>
+            <p className="font-bold truncate text-slate-800 text-[11px] mt-0.5">{lastRegisteredSaida.description}</p>
+            <div className="flex items-center gap-2 text-[10px] text-emerald-700 font-mono mt-0.5">
+              <span>Cód: <strong>{lastRegisteredSaida.barcode}</strong></span>
+              <span>•</span>
+              <span>Qtd: <strong>-{lastRegisteredSaida.qty} un</strong></span>
+              <span>•</span>
+              <span>Destino: <strong>{lastRegisteredSaida.destination}</strong></span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* CONTINUOUS READING AND SCANNING SETUP */}
       <div className="flex items-center justify-between bg-white border border-slate-200 px-4 py-3 rounded-xl shadow-sm">
@@ -379,11 +558,69 @@ export default function ScannerTab({ products, onAddProduct, onAddMovement, onAd
       </div>
 
       {scannerError && (
-        <div id="scanner-error-log" className="bg-amber-50 border border-amber-200 p-3 rounded-xl flex items-start gap-2.5 text-xs text-amber-700 leading-normal shadow-sm">
-          <AlertCircle size={16} className="shrink-0 mt-0.5 text-amber-600" />
-          <span>{scannerError}</span>
+        <div id="scanner-error-log" className="bg-amber-50 border border-amber-200 p-3.5 rounded-xl flex items-start gap-2.5 text-xs text-amber-800 leading-normal shadow-sm">
+          <AlertCircle size={18} className="shrink-0 mt-0.5 text-amber-600" />
+          <div className="flex-1">
+            <span className="font-bold block mb-1">Câmera bloqueada pelo celular</span>
+            <span>{scannerError}</span>
+          </div>
         </div>
       )}
+
+      {/* DIGITAÇÃO / LEITURA RÁPIDA DE CÓDIGO DIRETA */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-3.5 shadow-sm space-y-3">
+        <label className="block text-[11px] font-black uppercase text-slate-700 tracking-wider font-mono flex items-center justify-between">
+          <span>Digitar Código da Peça</span>
+          <span className="text-[10px] text-[#2497DE] font-semibold">Leitor / Digitação</span>
+        </label>
+        
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            const target = (e.currentTarget.elements.namedItem('manualCode') as HTMLInputElement);
+            if (target && target.value.trim()) {
+              handleBarcodeScanned(target.value.trim());
+              target.value = '';
+            }
+          }}
+          className="flex gap-2"
+        >
+          <input
+            name="manualCode"
+            type="text"
+            inputMode="numeric"
+            placeholder="Ex: 7838, 3913, 603..."
+            className="flex-1 bg-slate-50 border border-slate-300 rounded-xl px-3 py-2.5 text-sm font-mono font-bold focus:border-[#2497DE] focus:bg-white focus:outline-none transition"
+          />
+          <button
+            type="submit"
+            className="bg-[#2497DE] hover:bg-[#1d7ebc] text-white px-4 py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider transition shadow-sm active:scale-95"
+          >
+            Lançar Saída
+          </button>
+        </form>
+
+        <div className="pt-2 border-t border-slate-100">
+          <div className="text-[10px] text-slate-400 font-bold uppercase mb-1.5 font-mono">Toque rápido para testar:</div>
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              { code: '7838', name: '7838 - KIT REMO' },
+              { code: '3913', name: '3913 - LENTE TOYOTA' },
+              { code: '603', name: '603 - ABRAÇADEIRA' },
+              { code: '1091', name: '1091 - BORRACHA S10' }
+            ].map(item => (
+              <button
+                key={item.code}
+                type="button"
+                onClick={() => handleBarcodeScanned(item.code)}
+                className="bg-slate-100 hover:bg-slate-200 active:bg-blue-100 text-slate-700 text-[10px] font-bold font-mono px-2 py-1.5 rounded-lg border border-slate-200 transition"
+              >
+                ⚡ {item.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
 
       {/* DYNAMIC FORM MODALS BASED ON READ BARCODES */}
 

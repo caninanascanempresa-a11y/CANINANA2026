@@ -18,3 +18,5 @@ android/captures/
 .externalNativeBuild/
 .cxx/
 local.properties
+cert.pem
+key.pem
