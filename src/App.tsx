@@ -19,7 +19,7 @@ import {
   User as UserIcon
 } from 'lucide-react';
 import { Product, Movement, InventoryItem, SystemLog, User } from './types';
-import { INITIAL_PRODUCTS } from './initialData';
+import { INITIAL_PRODUCTS } from './productsCatalog';
 import LoginScreen from './components/LoginScreen';
 import DashboardTab from './components/DashboardTab';
 import ScannerTab from './components/ScannerTab';
@@ -655,23 +655,8 @@ export default function App() {
       let returnedData: any = null;
 
       if (gasUrl) {
+        // 1. Tenta envio direto ao Google Apps Script (Ideal para Vercel e produção)
         try {
-          // Via backend proxy
-          const resp = await fetch(getApiUrl('/api/sheets/sync'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ gasUrl, payload })
-          });
-          const json = await resp.json();
-          if (json.success) {
-            syncedSuccess = true;
-            returnedData = json.data;
-          } else {
-            throw new Error(json.error);
-          }
-        } catch (proxyErr: any) {
-          // Fallback chamada direta com headers simples
-          console.warn('Backend proxy indisponível, enviando direto ao Google Apps Script:', proxyErr);
           const directResp = await fetch(gasUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -684,6 +669,25 @@ export default function App() {
             returnedData = directJson.data;
           } else {
             throw new Error(directJson.error || 'Erro ao sincronizar');
+          }
+        } catch (directErr: any) {
+          console.warn('Envio direto falhou, tentando backend proxy local:', directErr);
+          // 2. Se falhar por CORS no localhost, tenta o backend proxy local
+          try {
+            const resp = await fetch(getApiUrl('/api/sheets/sync'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ gasUrl, payload })
+            });
+            const json = await resp.json();
+            if (json.success) {
+              syncedSuccess = true;
+              returnedData = json.data;
+            } else {
+              throw new Error(json.error);
+            }
+          } catch (proxyErr: any) {
+            throw new Error(directErr.message || proxyErr.message || 'Falha ao sincronizar');
           }
         }
       }
